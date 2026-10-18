@@ -45,8 +45,8 @@ try {
 
 async function registerMcpClientCommands(config) {
   try {
-    // pathToFileURL rather than bin/run.js's `file://${dataDir}/` template,
-    // which produces an invalid URL for Windows drive paths.
+    // pathToFileURL rather than bin/run.js's `file://${dataDir}/` template, so
+    // a data dir containing `#` or `%` still resolves.
     const pluginPath = pathToFileURL(join(config.dataDir, 'node_modules', '@hesed', 'mcp-client', 'dist', 'index.js')).href
     const {registerMcpClientCommands: register} = await import(pluginPath)
     await register(config)
