@@ -1,0 +1,23 @@
+[package]
+name = "sdkck-desktop"
+description = "Desktop app for sdkck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "sdkck-desktop"
+
+[lib]
+name = "sdkck_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sdkck-core = { path = "../crates/sdkck-core" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
