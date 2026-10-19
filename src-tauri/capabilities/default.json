@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window: core IPC, events, and opening sdkck's folders and docs links",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$HOME/**" }, { "path": "$APPDATA/**" }, { "path": "$APPLOCALDATA/**" }, { "path": "$CONFIG/**" }, { "path": "$DATA/**" }, { "path": "$LOCALDATA/**" }]
+    }
+  ]
+}
