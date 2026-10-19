@@ -6,6 +6,7 @@ import type {HistoryEntry} from '../lib/types.ts'
 import {RunConsole} from '../components/RunConsole.tsx'
 import {api, errorMessage} from '../lib/api.ts'
 import {shellQuote} from '../lib/argv.ts'
+import {useRunStore} from '../lib/runs.tsx'
 
 export function HistoryPage({ctx}: {ctx: AppContext}) {
   const [entries, setEntries] = useState<HistoryEntry[]>([])
@@ -13,6 +14,7 @@ export function HistoryPage({ctx}: {ctx: AppContext}) {
   const [rerun, setRerun] = useState<null | number>(null)
   const [error, setError] = useState<null | string>(null)
   const bin = ctx.catalog?.bin ?? 'sdkck'
+  const runs = useRunStore()
 
   const load = () => api.history().then(setEntries, (e) => setError(errorMessage(e)))
   useEffect(() => {
@@ -34,7 +36,13 @@ export function HistoryPage({ctx}: {ctx: AppContext}) {
             {cold.length > 0 && ` · cold avg ${avg(cold)} ms`}
           </p>
         </div>
-        <button className="ghost" onClick={() => api.clearHistory().then(load)} type="button">
+        <button className="ghost" onClick={() =>
+            api.clearHistory().then(() => {
+              runs.clearFinished()
+              setRerun(null)
+              load()
+            })
+          } type="button">
           Clear
         </button>
       </header>

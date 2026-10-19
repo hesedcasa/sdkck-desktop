@@ -173,6 +173,14 @@ fn revalidates_on_change() {
     std::thread::sleep(Duration::from_millis(20));
     write(&f.dirs.config.join("api-more.json"), r#"{"name":"more","operations":[]}"#);
     assert!(!catalog.fingerprint.is_current(), "a new spec file must invalidate the catalog");
+
+    // A malformed store file is tracked too, so repairing it in place is noticed.
+    write(&f.dirs.config.join("api-more.json"), "{not json");
+    let broken = build(&CatalogSource { root: &f.root, dirs: &f.dirs }).unwrap();
+    assert!(broken.warnings.iter().any(|w| w.contains("api-more.json")), "{:?}", broken.warnings);
+    std::thread::sleep(Duration::from_millis(20));
+    write(&f.dirs.config.join("api-more.json"), r#"{"name":"more","operations":[]}"#);
+    assert!(!broken.fingerprint.is_current(), "repairing a store file must invalidate the catalog");
 }
 
 fn node_available() -> bool {
@@ -190,7 +198,7 @@ fn cold_runs_stream_output_and_exit_codes() {
         &f.root.join("bin/run.js"),
         "process.stdout.write('args:' + process.argv.slice(2).join(',') + '\\n');\
          process.stderr.write('\\u001b[31mwarn\\u001b[0m\\n');\
-         if (process.argv[2] === 'sleep') setTimeout(() => {}, 60000); else process.exit(Number(process.argv[3] ?? 0));",
+         const mode = process.argv[2];         if (mode === 'tree' || mode === 'orphan') {           const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {stdio: 'inherit'});           require('fs').writeFileSync(process.argv[3], String(c.pid)); c.unref();         }         if (mode === 'sleep' || mode === 'tree') setTimeout(() => {}, 60000);         else if (mode !== 'orphan') process.exit(Number(process.argv[3] ?? 0));",
     );
     let env = Env::new(
         std::env::vars().chain([
@@ -243,4 +251,69 @@ fn cold_runs_stream_output_and_exit_codes() {
     let history = engine.history();
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].code, Some(3));
+
+    // Stop takes down everything the command spawned, not just node.
+    std::fs::create_dir_all(&f.dirs.cache).unwrap();
+    let pid_file = f.dirs.cache.join("tree.pid");
+    let (id, rx) = run(vec!["tree", pid_file.to_str().unwrap()]);
+    let pid = wait_for_pid(&pid_file);
+    assert!(engine.cancel(id));
+    let (_, _, _, cancelled) = collect(rx);
+    assert!(cancelled);
+    assert_process_gone(pid);
+
+    // A descendant that outlives the command and holds its pipes must not keep
+    // the run open.
+    let pid_file = f.dirs.cache.join("orphan.pid");
+    let started = std::time::Instant::now();
+    let (_, rx) = run(vec!["orphan", pid_file.to_str().unwrap()]);
+    let (_, code, _, _) = collect(rx);
+    assert_eq!(code, 0);
+    assert!(started.elapsed() < Duration::from_secs(10), "finished only after {:?}", started.elapsed());
+    kill_pid(wait_for_pid(&pid_file));
+
+    // Settings and history (API keys, command output) are owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&app.path().join("settings.json")), 0o600);
+        assert_eq!(mode(&app.path().join("history.json")), 0o600);
+        assert_eq!(mode(app.path()), 0o700);
+    }
+}
+
+fn wait_for_pid(file: &Path) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(file).ok().and_then(|s| s.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "child never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn assert_process_gone(pid: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) {
+        assert!(std::time::Instant::now() < deadline, "grandchild {pid} survived Stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+fn assert_process_gone(_pid: u32) {}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status();
 }

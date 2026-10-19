@@ -129,6 +129,8 @@ pub fn api_commands(config_dir: &Path, plugin_name: &str) -> DynamicSet {
     files.sort_by_key(|p| !p.file_name().unwrap().to_string_lossy().starts_with("api-"));
     let mut seen = std::collections::BTreeSet::new();
     for file in files {
+        // Tracked before parsing, so repairing a malformed file invalidates the cache.
+        set.files.push(file.clone());
         let spec: StoredSpec = match crate::manifest::read_json(&file) {
             Ok(s) => s,
             Err(e) => {
@@ -136,7 +138,6 @@ pub fn api_commands(config_dir: &Path, plugin_name: &str) -> DynamicSet {
                 continue;
             }
         };
-        set.files.push(file);
         if !seen.insert(spec.name.clone()) {
             continue;
         }
@@ -227,6 +228,8 @@ pub fn mcp_commands(config_dir: &Path, plugin_name: &str) -> DynamicSet {
     let mut set = DynamicSet { commands: vec![], topics: vec![], warnings: vec![], files: vec![] };
     let is_server_file = |n: &str| n.starts_with("mcp-client-") && n.ends_with(".json") && !n.ends_with("-oauth.json");
     for file in list_config_files(config_dir, is_server_file) {
+        // Tracked before parsing, so repairing a malformed file invalidates the cache.
+        set.files.push(file.clone());
         let server: McpServerFile = match crate::manifest::read_json(&file) {
             Ok(s) => s,
             Err(e) => {
@@ -234,7 +237,6 @@ pub fn mcp_commands(config_dir: &Path, plugin_name: &str) -> DynamicSet {
                 continue;
             }
         };
-        set.files.push(file);
         if server.cached_tools.is_empty() {
             continue;
         }

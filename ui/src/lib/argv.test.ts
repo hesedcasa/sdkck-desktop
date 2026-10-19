@@ -3,7 +3,7 @@ import {test} from 'node:test'
 
 import type {CommandMeta} from './types.ts'
 
-import {buildArgv, missingRequired, shellQuote, splitArgs} from './argv.ts'
+import {booleanEditable, booleanOn, buildArgv, missingRequired, shellQuote, splitArgs} from './argv.ts'
 
 const flag = (name: string, extra: Partial<CommandMeta['flags'][number]> = {}): CommandMeta['flags'][number] => ({
   allowNo: false,
@@ -49,4 +49,20 @@ test('quotes and splits round-trip', () => {
   const argv = ['jira', 'issue', 'search', '--jql', `project = "SS" AND summary ~ 'it''s'`, '']
   assert.deepEqual(splitArgs(shellQuote(argv)), argv)
   assert.deepEqual(splitArgs(`api call  "a b" c\\ d 'e'`), ['api', 'call', 'a b', 'c d', 'e'])
+})
+
+test('boolean defaults: default-on flags are only sent to turn them off', () => {
+  const on = {args: [], flags: [flag('verify', {default: true, kind: 'boolean'}), flag('cache', {allowNo: true, default: true, kind: 'boolean'})]}
+  assert.deepEqual(buildArgv(on, {args: {}, flags: {}}), [])
+  assert.deepEqual(buildArgv(on, {args: {}, flags: {cache: true, verify: true}}), [])
+  assert.deepEqual(buildArgv(on, {args: {}, flags: {cache: false}}), ['--no-cache'])
+  assert.equal(booleanOn(on.flags[0], undefined), true)
+  assert.equal(booleanEditable(on.flags[0]), false)
+  assert.equal(booleanEditable(on.flags[1]), true)
+})
+
+test('keeps Windows backslashes literal', () => {
+  assert.deepEqual(splitArgs(String.raw`api import "C:\Users\me\spec.json"`), ['api', 'import', String.raw`C:\Users\me\spec.json`])
+  assert.deepEqual(splitArgs(String.raw`api import C:\Users\me\spec.json \\server\share`), ['api', 'import', String.raw`C:\Users\me\spec.json`, String.raw`\\server\share`])
+  assert.deepEqual(splitArgs(String.raw`echo "say \"hi\"" a\'b`), ['echo', 'say "hi"', "a'b"])
 })

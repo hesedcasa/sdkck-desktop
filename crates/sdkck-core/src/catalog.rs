@@ -486,7 +486,7 @@ fn from_manifest(id: &str, mc: ManifestCommand, plugin: &str, ptype: &str, sourc
                 kind,
                 allow_no: f.allow_no,
                 options: if kind == FlagKind::Boolean { None } else { f.options },
-                default: if kind == FlagKind::Boolean { None } else { f.default },
+                default: f.default,
             }
         })
         .collect();

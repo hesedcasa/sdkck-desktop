@@ -1,4 +1,4 @@
-import type {FormValues} from '../lib/argv.ts'
+import {booleanEditable, booleanOn, type FormValues} from '../lib/argv.ts'
 import type {CommandMeta} from '../lib/types.ts'
 
 type Props = {
@@ -61,7 +61,13 @@ export function CommandForm({command, onChange, values}: Props) {
         if (flag.kind === 'boolean') {
           return (
             <label className="field check" key={`flag-${flag.name}`}>
-              <input checked={values.flags[flag.name] === true} onChange={(e) => setFlag(flag.name, e.target.checked)} type="checkbox" />
+              <input
+                checked={booleanOn(flag, values.flags[flag.name])}
+                disabled={!booleanEditable(flag)}
+                onChange={(e) => setFlag(flag.name, e.target.checked)}
+                title={booleanEditable(flag) ? undefined : 'On by default; this command has no --no- form'}
+                type="checkbox"
+              />
               <div>
                 {label}
                 {flag.description && <small>{flag.description}</small>}

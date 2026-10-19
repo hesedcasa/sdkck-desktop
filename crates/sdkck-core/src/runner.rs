@@ -75,12 +75,49 @@ impl RunnerConfig {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        // Its own process group, so Stop can take down everything it spawned.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
         cmd
     }
 }
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Kill a child and every process it started (plugins spawn MCP servers,
+/// git, database clients…), not just the direct Node process.
+fn kill_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // The child leads its own process group (see `RunnerConfig::command`).
+        // SAFETY: plain syscall on a pid we spawned; a stale group is a no-op.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// How long a finished command's output pipes may stay open — held by a
+/// descendant that outlived it — before the run is reported finished anyway.
+const PIPE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -179,7 +216,7 @@ impl Worker {
         let line = serde_json::json!({"id": run_id, "argv": argv}).to_string() + "\n";
         if self.stdin.lock().unwrap().write_all(line.as_bytes()).is_err() {
             // The reader thread sees EOF and finishes the run as failed.
-            let _ = self.child.lock().unwrap().kill();
+            kill_tree(&mut self.child.lock().unwrap());
         }
         true
     }
@@ -188,7 +225,7 @@ impl Worker {
         if let Some(active) = self.shared.0.lock().unwrap().active.as_mut() {
             active.cancelled = true;
         }
-        let _ = self.child.lock().unwrap().kill();
+        kill_tree(&mut self.child.lock().unwrap());
     }
 
     fn is_running(&self, run_id: u64) -> bool {
@@ -198,7 +235,9 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.child.get_mut().map(|c| c.kill());
+        if let Ok(c) = self.child.get_mut() {
+            kill_tree(c);
+        }
     }
 }
 
@@ -299,6 +338,8 @@ fn read_protocol(stdout: std::process::ChildStdout, shared: &Arc<(Mutex<Shared>,
 pub struct Runner {
     config: Mutex<Option<RunnerConfig>>,
     worker: Mutex<Option<Arc<Worker>>>,
+    /// Recycled workers still finishing a run; kept reachable so Stop works.
+    retiring: Arc<Mutex<Vec<Arc<Worker>>>>,
     cold: Arc<Mutex<HashMap<u64, Arc<Mutex<Child>>>>>,
     cancelled: Arc<Mutex<std::collections::HashSet<u64>>>,
 }
@@ -326,10 +367,13 @@ impl Runner {
                 w.kill();
             } else {
                 // Let the in-flight run finish; just stop routing new ones to it.
+                self.retiring.lock().unwrap().push(w.clone());
+                let retiring = self.retiring.clone();
                 std::thread::spawn(move || {
                     while w.shared.0.lock().unwrap().active.is_some() {
                         std::thread::sleep(Duration::from_millis(100));
                     }
+                    retiring.lock().unwrap().retain(|r| !Arc::ptr_eq(r, &w));
                     w.kill();
                 });
             }
@@ -400,18 +444,40 @@ impl Runner {
         let cold = self.cold.clone();
         let cancelled = self.cancelled.clone();
         std::thread::spawn(move || {
-            let s1 = sink.clone();
-            let t1 = std::thread::spawn(move || pump(stdout, run_id, Stream::Stdout, &s1));
-            let s2 = sink.clone();
-            let t2 = std::thread::spawn(move || pump(stderr, run_id, Stream::Stderr, &s2));
-            let _ = t1.join();
-            let _ = t2.join();
+            // Output that arrives after Finished (from a lingering descendant) is dropped.
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let gated: Sink = {
+                let (sink, closed) = (sink.clone(), closed.clone());
+                Arc::new(move |e| {
+                    if !closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        sink(e)
+                    }
+                })
+            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            for (pipe, stream) in [(Box::new(stdout) as Box<dyn Read + Send>, Stream::Stdout), (Box::new(stderr), Stream::Stderr)]
+            {
+                let (sink, done) = (gated.clone(), done_tx.clone());
+                std::thread::spawn(move || {
+                    pump(pipe, run_id, stream, &sink);
+                    let _ = done.send(());
+                });
+            }
             let status = loop {
                 if let Some(status) = child.lock().unwrap().try_wait().ok().flatten() {
                     break Some(status);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             };
+            // Drain what the command wrote, but never wait on a descendant that
+            // inherited the pipes and is still running.
+            let deadline = Instant::now() + PIPE_GRACE;
+            for _ in 0..2 {
+                if done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err() {
+                    break;
+                }
+            }
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
             cold.lock().unwrap().remove(&run_id);
             let was_cancelled = cancelled.lock().unwrap().remove(&run_id);
             let code = status.map_or(1, exit_code);
@@ -430,12 +496,18 @@ impl Runner {
     pub fn cancel(&self, run_id: u64) -> bool {
         if let Some(child) = self.cold.lock().unwrap().get(&run_id) {
             self.cancelled.lock().unwrap().insert(run_id);
-            let _ = child.lock().unwrap().kill();
+            kill_tree(&mut child.lock().unwrap());
             return true;
         }
         let mut slot = self.worker.lock().unwrap();
         if slot.as_ref().is_some_and(|w| w.is_running(run_id)) {
             slot.take().unwrap().kill();
+            return true;
+        }
+        drop(slot);
+        let retiring = self.retiring.lock().unwrap().iter().find(|w| w.is_running(run_id)).cloned();
+        if let Some(w) = retiring {
+            w.kill();
             return true;
         }
         false

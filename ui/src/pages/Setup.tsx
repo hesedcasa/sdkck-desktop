@@ -2,9 +2,10 @@ import {listen} from '@tauri-apps/api/event'
 import {openUrl} from '@tauri-apps/plugin-opener'
 import {useEffect, useRef, useState} from 'react'
 
-import type {CatalogSummary, RunEvent, Status} from '../lib/types.ts'
+import type {CatalogSummary, Status} from '../lib/types.ts'
 
 import {api, errorMessage} from '../lib/api.ts'
+import {useRunStore} from '../lib/runs.tsx'
 import {KNOWN_PLUGINS} from './Plugins.tsx'
 
 /** Installs sdkck into the app's own runtime folder, streaming npm's log. */
@@ -52,17 +53,6 @@ export function SdkckInstaller({label, onDone}: {label: string; onDone: (s: Stat
   )
 }
 
-function waitForRun(runId: number): Promise<number> {
-  return new Promise((resolve) => {
-    const off = listen<RunEvent>('run-event', (e) => {
-      if (e.payload.runId === runId && e.payload.type === 'finished') {
-        off.then((f) => f())
-        resolve(e.payload.code)
-      }
-    })
-  })
-}
-
 type Props = {onDone: () => Promise<void>; setStatus: (s: Status) => void; status: Status}
 
 export function SetupWizard({onDone, setStatus, status}: Props) {
@@ -74,6 +64,7 @@ export function SetupWizard({onDone, setStatus, status}: Props) {
   const [installing, setInstalling] = useState(false)
   const [nodePath, setNodePath] = useState('')
   const [error, setError] = useState<null | string>(null)
+  const runs = useRunStore()
 
   useEffect(() => {
     if (nodeOk && sdkckOk) api.catalog().then(setCatalog, (e) => setError(errorMessage(e)))
@@ -90,7 +81,9 @@ export function SetupWizard({onDone, setStatus, status}: Props) {
       setProgress((p) => ({...p, [name]: 'installing'}))
       try {
         const runId = await api.installPlugin(name)
-        const code = await waitForRun(runId)
+        // The store has buffered the run since before invoke returned, so a
+        // fast install can't finish unseen.
+        const {code} = await runs.wait(runId)
         setProgress((p) => ({...p, [name]: code === 0 ? 'done' : 'failed'}))
       } catch {
         setProgress((p) => ({...p, [name]: 'failed'}))
@@ -122,6 +115,22 @@ export function SetupWizard({onDone, setStatus, status}: Props) {
           <li className={step === 3 ? 'current' : ''}>Plugins</li>
         </ol>
         {error && <div className="banner error">{error}</div>}
+        {(status.settings.nodePath || status.settings.sdkckRoot) && (
+          <div className="banner info">
+            <span>
+              Using custom paths from Settings
+              {status.settings.nodePath && <> — Node.js: <code>{status.settings.nodePath}</code></>}
+              {status.settings.sdkckRoot && <> — sdkck: <code>{status.settings.sdkckRoot}</code></>}
+            </span>
+            <button
+              className="ghost small"
+              onClick={() => api.saveSettings({...status.settings, nodePath: null, sdkckRoot: null}).then(setStatus, (e) => setError(errorMessage(e)))}
+              type="button"
+            >
+              Clear custom paths
+            </button>
+          </div>
+        )}
 
         {step === 1 && (
           <section>

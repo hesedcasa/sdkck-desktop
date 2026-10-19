@@ -72,10 +72,14 @@ pub fn read(config_dir: &Path) -> Result<Option<PermissionConfig>> {
     };
     let parsed: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| Error::Invalid(format!("Permission config at {} is not valid JSON: {e}", path.display())))?;
-    let rules = |key: &str| -> Option<Vec<Rule>> {
+    // A malformed rule array is an error, never an empty list: edits write the
+    // config back, so dropping one bad entry would erase every valid rule.
+    let rules = |key: &str| -> Result<Option<Vec<Rule>>> {
         match parsed.get(key) {
-            None | Some(serde_json::Value::Null) => None,
-            Some(v) => Some(serde_json::from_value(v.clone()).unwrap_or_default()),
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| Error::Invalid(format!("Permission config at {} has a malformed \"{key}\": {e}", path.display()))),
         }
     };
     match parsed.get("version").and_then(serde_json::Value::as_u64) {
@@ -84,19 +88,22 @@ pub fn read(config_dir: &Path) -> Result<Option<PermissionConfig>> {
             path.display()
         ))),
         Some(_) => Ok(Some(PermissionConfig {
-            allow_rules: rules("allowRules").unwrap_or_default(),
-            deny_rules: rules("denyRules").unwrap_or_default(),
+            allow_rules: rules("allowRules")?.unwrap_or_default(),
+            deny_rules: rules("denyRules")?.unwrap_or_default(),
         })),
         // Legacy file: "rules" was the deny list; a missing allowRules means allow-all.
         None => {
             let allow_rules = if parsed.get("allowRules").is_none() {
                 vec![Rule { pattern: "*".into() }]
             } else {
-                rules("allowRules").unwrap_or_default()
+                rules("allowRules")?.unwrap_or_default()
             };
             Ok(Some(PermissionConfig {
                 allow_rules,
-                deny_rules: rules("denyRules").or_else(|| rules("rules")).unwrap_or_default(),
+                deny_rules: match rules("denyRules")? {
+                    Some(r) => r,
+                    None => rules("rules")?.unwrap_or_default(),
+                },
             }))
         }
     }
@@ -243,6 +250,16 @@ mod tests {
         std::fs::write(config_path(dir.path()), r#"{"rules":[{"pattern":"bb"}]}"#).unwrap();
         let legacy = read(dir.path()).unwrap().unwrap();
         assert_eq!(legacy, cfg(&["*"], &["bb"]));
+
+        // One bad entry must fail the read (and so every edit), not empty the list.
+        std::fs::write(
+            config_path(dir.path()),
+            r#"{"version":1,"allowRules":[{"pattern":"*"}],"denyRules":[{"pattern":"bb"},{}]}"#,
+        )
+        .unwrap();
+        assert!(read(dir.path()).is_err());
+        assert!(add_rule(dir.path(), RuleKind::Allow, "jira").is_err());
+        assert!(std::fs::read_to_string(config_path(dir.path())).unwrap().contains(r#""pattern":"bb""#));
 
         std::fs::write(config_path(dir.path()), r#"{"version":9}"#).unwrap();
         assert!(read(dir.path()).is_err());

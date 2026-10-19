@@ -55,6 +55,14 @@ export function App() {
     return () => clearInterval(timer)
   }, [refresh])
 
+  // Becoming ready outside `refresh` (setup steps, clearing a bad override)
+  // must still load the catalog for topics and the status bar.
+  const ready = status?.ready ?? false
+  const sdkckRoot = status?.sdkck?.root
+  useEffect(() => {
+    if (ready) api.catalog().then(setCatalog, (error_) => setError(errorMessage(error_)))
+  }, [ready, sdkckRoot])
+
   const openCommand = useCallback((id: string) => {
     setSelected(id)
     setPage('commands')

@@ -245,9 +245,7 @@ impl Engine {
 
     pub fn save_settings(self: &Arc<Self>, settings: Settings) -> Result<Status> {
         let login_changed = self.settings.read().unwrap().login_shell_env != settings.login_shell_env;
-        std::fs::create_dir_all(&self.app_dir).map_err(|e| Error::io(&self.app_dir, e))?;
-        std::fs::write(&self.settings_path, serde_json::to_string_pretty(&settings)?)
-            .map_err(|e| Error::io(&self.settings_path, e))?;
+        write_private(&self.app_dir, &self.settings_path, &serde_json::to_string_pretty(&settings)?)?;
         if login_changed {
             *self.shell_env.lock().unwrap() = None;
         }
@@ -257,15 +255,24 @@ impl Engine {
     }
 
     /// The catalog, rebuilt only when a file it was built from changed.
+    ///
+    /// Those are the same files the warm worker loaded at boot, so a rebuild
+    /// over a stale catalog — whether this app's run or the CLI changed them —
+    /// also restarts the worker; otherwise it would keep running old plugin code.
     pub fn catalog(&self) -> Result<Arc<Catalog>> {
-        let mut slot = self.catalog.lock().unwrap();
-        if let Some(c) = slot.as_ref().filter(|c| c.fingerprint.is_current()) {
-            return Ok(c.clone());
+        let (built, was_stale) = {
+            let mut slot = self.catalog.lock().unwrap();
+            if let Some(c) = slot.as_ref().filter(|c| c.fingerprint.is_current()) {
+                return Ok(c.clone());
+            }
+            let state = self.state.read().unwrap();
+            let sdkck = state.sdkck.as_ref().ok_or_else(|| Error::NotFound("sdkck is not installed yet".into()))?;
+            let built = Arc::new(catalog::build(&CatalogSource { root: &sdkck.root, dirs: &state.dirs })?);
+            (built.clone(), slot.replace(built).is_some())
+        };
+        if was_stale {
+            self.restart_worker();
         }
-        let state = self.state.read().unwrap();
-        let sdkck = state.sdkck.as_ref().ok_or_else(|| Error::NotFound("sdkck is not installed yet".into()))?;
-        let built = Arc::new(catalog::build(&CatalogSource { root: &sdkck.root, dirs: &state.dirs })?);
-        *slot = Some(built.clone());
         Ok(built)
     }
 
@@ -343,13 +350,8 @@ impl Engine {
     /// worker so its next run sees the new commands.
     fn after_run(self: &Arc<Self>) {
         self.persist_history();
-        let stale = self.catalog.lock().unwrap().as_ref().is_some_and(|c| !c.fingerprint.is_current());
-        if stale {
-            self.runner.recycle();
-            if self.settings.read().unwrap().warm_runner && !self.interception().forces_cold_runs() {
-                self.runner.prewarm();
-            }
-        }
+        // Rebuilding a stale catalog recycles the worker (see `catalog`).
+        let _ = self.catalog();
     }
 
     pub fn cancel(&self, run_id: u64) -> bool {
@@ -357,7 +359,7 @@ impl Engine {
     }
 
     /// Restart the warm worker (e.g. after editing a plugin by hand).
-    pub fn restart_worker(self: &Arc<Self>) {
+    pub fn restart_worker(&self) {
         self.runner.recycle();
         if self.settings.read().unwrap().warm_runner && !self.interception().forces_cold_runs() {
             self.runner.prewarm();
@@ -477,8 +479,7 @@ impl Engine {
     fn persist_history(&self) {
         let snapshot: Vec<HistoryEntry> = self.history.lock().unwrap().iter().filter(|h| h.code.is_some()).cloned().collect();
         if let Ok(body) = serde_json::to_string(&snapshot) {
-            let _ = std::fs::create_dir_all(&self.app_dir);
-            let _ = std::fs::write(&self.history_path, body);
+            let _ = write_private(&self.app_dir, &self.history_path, &body);
         }
     }
 
@@ -522,5 +523,34 @@ fn validate_spec(spec: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Invalid(format!("{spec:?} is not a valid plugin name")))
+    }
+}
+
+/// Write `path` readable by the owner only, creating `dir` the same way:
+/// settings hold API keys and history holds command arguments and output.
+fn write_private(dir: &Path, path: &Path, body: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let restrict =
+            |p: &Path, mode| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).map_err(|e| Error::io(p, e));
+        restrict(dir, 0o700)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| Error::io(path, e))?;
+        // `mode` only applies on creation; tighten a file written by an older version.
+        restrict(path, 0o600)?;
+        file.write_all(body.as_bytes()).map_err(|e| Error::io(path, e))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: the per-user app data directory is already private to the user.
+        std::fs::write(path, body).map_err(|e| Error::io(path, e))
     }
 }

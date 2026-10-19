@@ -11,13 +11,23 @@ export type FormValues = {
 
 export const emptyForm = (): FormValues => ({args: {}, flags: {}})
 
+type BooleanFlag = Pick<CommandMeta['flags'][number], 'allowNo' | 'default'>
+
+/** A boolean flag's effective value: the user's choice, else the flag's default. */
+export const booleanOn = (flag: BooleanFlag, value: boolean | string | undefined): boolean =>
+  typeof value === 'boolean' ? value : flag.default === true
+
+/** Whether the form can change a boolean flag (a default-on flag needs `--no-`). */
+export const booleanEditable = (flag: BooleanFlag): boolean => flag.default !== true || flag.allowNo
+
 /** Build the argv that follows the command id. */
 export function buildArgv(command: Pick<CommandMeta, 'args' | 'flags'>, values: FormValues): string[] {
   const flagArgv: string[] = []
   for (const flag of command.flags) {
     const value = values.flags[flag.name]
     if (flag.kind === 'boolean') {
-      if (value === true) flagArgv.push(`--${flag.name}`)
+      // A default-on flag is already on; turning one off needs its --no- form.
+      if (value === true && flag.default !== true) flagArgv.push(`--${flag.name}`)
       else if (value === false && flag.allowNo) flagArgv.push(`--no-${flag.name}`)
       continue
     }
@@ -51,7 +61,7 @@ export function missingRequired(command: Pick<CommandMeta, 'args' | 'flags'>, va
   for (const flag of command.flags) {
     if (!flag.required) continue
     const value = values.flags[flag.name]
-    const empty = flag.kind === 'boolean' ? value !== true : typeof value !== 'string' || !value.trim()
+    const empty = flag.kind === 'boolean' ? !booleanOn(flag, value) : typeof value !== 'string' || !value.trim()
     if (empty) missing.push(`--${flag.name}`)
   }
 
@@ -65,7 +75,11 @@ export function shellQuote(argv: string[]): string {
   return argv.map((a) => (a !== '' && SAFE.test(a) ? a : `'${a.replaceAll("'", `'\\''`)}'`)).join(' ')
 }
 
-/** Split a typed command line into argv, honouring '…', "…" and backslash escapes. */
+/**
+ * Split a typed command line into argv, honouring '…' and "…". A backslash
+ * only escapes a quote or (outside quotes) whitespace; anywhere else it is
+ * literal, so pasted Windows paths like C:\Users\me survive.
+ */
 export function splitArgs(line: string): string[] {
   const out: string[] = []
   let current = ''
@@ -75,12 +89,12 @@ export function splitArgs(line: string): string[] {
     const c = line[i]
     if (quote) {
       if (c === quote) quote = null
-      else if (c === '\\' && quote === '"' && i + 1 < line.length) current += line[++i]
+      else if (c === '\\' && quote === '"' && line[i + 1] === '"') current += line[++i]
       else current += c
     } else if (c === '"' || c === "'") {
       quote = c
       started = true
-    } else if (c === '\\' && i + 1 < line.length) {
+    } else if (c === '\\' && i + 1 < line.length && /[\s'"]/.test(line[i + 1])) {
       current += line[++i]
       started = true
     } else if (/\s/.test(c)) {
